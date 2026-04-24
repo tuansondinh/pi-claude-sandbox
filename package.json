@@ -1,0 +1,63 @@
+{
+  "name": "pi-claude-sandbox",
+  "version": "0.4.0",
+  "description": "Claude-style OS-level sandboxing for pi with interactive permission prompts. Coexists with pi-tool-display and other bash-overriding extensions. Forked from carderne/pi-sandbox.",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "sandbox",
+    "claude"
+  ],
+  "type": "module",
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/tuansondinh/pi-claude-sandbox.git"
+  },
+  "author": "Son Dinh",
+  "contributors": [
+    "Chris Arderne <chris@rdrn.me> (original pi-sandbox)",
+    "Mario Zechner (original pi-mono sandbox example)"
+  ],
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/tuansondinh/pi-claude-sandbox/issues"
+  },
+  "homepage": "https://github.com/tuansondinh/pi-claude-sandbox",
+  "scripts": {
+    "fmt": "oxfmt index.ts",
+    "lint": "oxlint index.ts",
+    "check": "tsc --noEmit",
+    "ci:fmt": "oxfmt --check index.ts",
+    "ci:lint": "npm run lint",
+    "ci:check": "npm run check"
+  },
+  "dependencies": {
+    "@carderne/sandbox-runtime": "^0.0.43"
+  },
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": "^0.61.0"
+  },
+  "peerDependenciesMeta": {
+    "@mariozechner/pi-coding-agent": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@mariozechner/pi-coding-agent": "^0.61.0",
+    "@types/node": "^24",
+    "oxfmt": "^0.33.0",
+    "oxlint": "^1.48.0",
+    "typescript": "^5"
+  },
+  "overrides": {
+    "minimatch": ">=10.2.1"
+  }
+}
