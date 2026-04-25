@@ -1,3 +1,7 @@
 node_modules/
-*.tgz
 .DS_Store
+*.log
+npm-debug.log*
+coverage/
+.dist/
+.claude/settings.local.json

@@ -2,15 +2,21 @@
  * Based on https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/examples/extensions/sandbox/index.ts
  * by Mario Zechner, used under the MIT License.
  *
- * Sandbox Extension - OS-level sandboxing for bash commands, plus path policy
- * enforcement for pi's read/write/edit tools, with interactive permission prompts.
+ * Sandbox Extension - OS-level sandboxing for bash commands and their
+ * subprocesses. Uses @carderne/sandbox-runtime with sandbox-exec (macOS) or
+ * bubblewrap (Linux) to enforce filesystem and network restrictions at the
+ * kernel level.
  *
- * Uses @carderne/sandbox-runtime to enforce filesystem and network
- * restrictions on bash commands at the OS level (sandbox-exec on macOS,
- * bubblewrap on Linux). Also intercepts the read, write, and edit tools to
- * apply the same denyRead/denyWrite/allowWrite filesystem rules, which OS-level
- * sandboxing cannot cover (those tools run directly in Node.js, not in a
- * subprocess).
+ * Scope:
+ *   - Bash subprocesses: kernel-enforced filesystem + network rules
+ *   - Domain pre-check: prompt before network egress to non-allowed domains
+ *   - Bash OS-write block recovery: when sandbox blocks a bash write, prompt
+ *     the user to grant access and retry on next turn
+ *
+ * NOT scoped here:
+ *   - Read/Write/Edit tool gating. Those run in-process in Node.js, not in a
+ *     subprocess, so OS sandboxing cannot cover them. Use a permission rules
+ *     extension (e.g. pi-claude-permissions) for tool-level allow/ask/deny.
  *
  * When a block is triggered, the user is prompted to:
  *   (a) Abort (keep blocked)
@@ -18,13 +24,8 @@
  *   (c) Allow for this project       — written to .pi/sandbox.json
  *   (d) Allow for all projects       — written to ~/.pi/agent/sandbox.json
  *
- * What gets prompted vs. hard-blocked:
- *   - domains: prompted if not whitelisted nor explicitly denied
- *   - write: prompted if not whitelisted nor explicitly denied
- *   - read: always prompted (because denyRead is used for broad block, may want to punch holes)
- *
- * IMPORTANT — precedence for read:
- *   Read:  allowRead OVERRIDES denyRead (prompt grant adds to allowRead)
+ * Filesystem rule semantics (applied to bash subprocesses via OS sandbox):
+ *   Read:  allowRead OVERRIDES denyRead
  *   Write: denyWrite OVERRIDES allowWrite (most-specific deny wins)
  *
  * Config files (merged, project takes precedence):
@@ -40,10 +41,10 @@
  *     "deniedDomains": []
  *   },
  *   "filesystem": {
- *     "denyRead": ["/Users", "/home"],
- *     "allowRead": [".", "~/.config", "~/.local", "Library"],
- *     "allowWrite": [".", "/tmp"],
- *     "denyWrite": [".env"]
+ *     "denyRead":  [".env", "*.pem", "~/.ssh", "~/.aws"],
+ *     "allowRead": [],
+ *     "allowWrite": [".", "/tmp", "~/.npm", "~/.cache"],
+ *     "denyWrite": [".env", "~/.bashrc", "~/.ssh"]
  *   }
  * }
  * ```
@@ -95,10 +96,51 @@ const DEFAULT_CONFIG: SandboxConfig = {
     deniedDomains: [],
   },
   filesystem: {
-    denyRead: ["/Users", "/home"],
-    allowRead: [".", "~/.config", "~/.local", "Library"],
-    allowWrite: [".", "/tmp"],
-    denyWrite: [".env", ".env.*", "*.pem", "*.key"],
+    // Open reads: subprocess can read anything by default. Only secrets are
+    // hard-denied. No broad home-dir deny — tools need to read tons of files,
+    // and a subprocess reading ~/Documents isn't a real threat (network egress
+    // is already constrained by the proxy).
+    denyRead: [
+      ".env",
+      ".env.*",
+      "*.pem",
+      "*.key",
+      "~/.ssh",
+      "~/.aws",
+      "~/.gnupg",
+    ],
+    // Empty allowRead: nothing to punch holes through. denyRead entries are
+    // hard (no grant flow for reads). User can still add specific paths here
+    // to override denyRead if truly needed.
+    allowRead: [],
+    allowWrite: [
+      ".",
+      "/tmp",
+      // Tool caches — without these, npm/cargo/gradle/maven fail or prompt-spam.
+      "~/.npm",
+      "~/.cache",
+      "~/.cargo/registry",
+      "~/.gradle/caches",
+      "~/.m2/repository",
+    ],
+    denyWrite: [
+      // Secrets — hard block.
+      ".env",
+      ".env.*",
+      "*.pem",
+      "*.key",
+      // Shell rc — persistence vector.
+      "~/.bashrc",
+      "~/.zshrc",
+      "~/.profile",
+      "~/.bash_profile",
+      // Credentials / auth.
+      "~/.ssh",
+      "~/.gitconfig",
+      // macOS auto-launch.
+      "~/Library/LaunchAgents",
+      "~/Library/LaunchDaemons",
+    ],
   },
 };
 
@@ -189,25 +231,85 @@ function domainIsAllowed(domain: string, allowedDomains: string[]): boolean {
 
 // ── Output analysis ───────────────────────────────────────────────────────────
 
-/** Extract a path from a bash "Operation not permitted" OS sandbox error. */
-function extractBlockedWritePath(output: string): string | null {
-  const match = output.match(/(?:\/bin\/bash|bash|sh): (\/[^\s:]+): Operation not permitted/);
-  return match ? match[1] : null;
+/**
+ * Extract a path from a bash "Operation not permitted" OS sandbox error.
+ *
+ * Bash reports the path exactly as written in the redirect, which can be
+ * absolute (`/tmp/.env`), relative (`.env`), or ~-prefixed (`~/.bashrc`).
+ * The original regex required a leading slash and missed relative paths,
+ * causing the auto-retry/permission flow to silently no-op for those cases.
+ */
+function extractBlockedWritePath(output: string, cwd: string): string | null {
+  const match = output.match(/(?:\/bin\/bash|bash|sh): ([^\s:][^:]*): Operation not permitted/);
+  if (!match) return null;
+  const raw = match[1].replace(/^["'`]|["'`]$/g, "").trim();
+  if (!raw) return null;
+  if (raw.startsWith("/")) return raw;
+  if (raw.startsWith("~")) return raw.replace(/^~/, homedir());
+  return resolve(cwd, raw);
 }
 
 // ── Path pattern matching ─────────────────────────────────────────────────────
 
+/**
+ * Convert a glob pattern to a RegExp.
+ *   **  matches any number of path segments (including /)
+ *   *   matches a single segment  (no /)
+ *   ?   matches one char          (no /)
+ * Other regex metacharacters are escaped.
+ */
+function globToRegex(pattern: string): RegExp {
+  let out = "";
+  for (let i = 0; i < pattern.length; i++) {
+    const c = pattern[i];
+    if (c === "*") {
+      if (pattern[i + 1] === "*") {
+        out += ".*";
+        i++;
+      } else {
+        out += "[^/]*";
+      }
+    } else if (c === "?") {
+      out += "[^/]";
+    } else if (/[.+^${}()|[\]\\]/.test(c)) {
+      out += "\\" + c;
+    } else {
+      out += c;
+    }
+  }
+  return new RegExp(`^${out}$`);
+}
+
+/**
+ * Match a filesystem path against a list of patterns. Patterns can be:
+ *   - Literal paths (optionally ~-prefixed) — prefix match.
+ *   - Absolute or ~-rooted globs like `/Users/x/*.pem` — anchored full match.
+ *   - Relative globs like `**\/.env` or `*.key` — match the path tail at any
+ *     depth (so `**\/.env` matches `/tmp/.env`).
+ *
+ * The original implementation called `resolve()` on every pattern, which
+ * mangled glob segments like `**\/.env` into `<cwd>/**\/.env` and broke
+ * recursive matches.
+ */
 function matchesPattern(filePath: string, patterns: string[]): boolean {
   const expanded = filePath.replace(/^~/, homedir());
   const abs = resolve(expanded);
+
   return patterns.some((p) => {
+    const hasGlob = p.includes("*") || p.includes("?");
     const expandedP = p.replace(/^~/, homedir());
-    const absP = resolve(expandedP);
-    if (p.includes("*")) {
-      const escaped = absP.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*");
-      return new RegExp(`^${escaped}$`).test(abs);
+
+    if (!hasGlob) {
+      const absP = resolve(expandedP);
+      return abs === absP || abs.startsWith(absP + "/");
     }
-    return abs === absP || abs.startsWith(absP + "/");
+
+    if (expandedP.startsWith("/")) {
+      return globToRegex(expandedP).test(abs);
+    }
+
+    const anchored = expandedP.startsWith("**") ? expandedP : `**/${expandedP}`;
+    return globToRegex(anchored).test(abs);
   });
 }
 
@@ -245,21 +347,6 @@ function addDomainToConfig(configPath: string, domain: string): void {
       ...config.network,
       allowedDomains: [...existing, domain],
       deniedDomains: config.network?.deniedDomains ?? [],
-    };
-    writeConfigFile(configPath, config);
-  }
-}
-
-function addReadPathToConfig(configPath: string, pathToAdd: string): void {
-  const config = readOrEmptyConfig(configPath);
-  const existing = config.filesystem?.allowRead ?? [];
-  if (!existing.includes(pathToAdd)) {
-    config.filesystem = {
-      ...config.filesystem,
-      allowRead: [...existing, pathToAdd],
-      denyRead: config.filesystem?.denyRead ?? [],
-      allowWrite: config.filesystem?.allowWrite ?? [],
-      denyWrite: config.filesystem?.denyWrite ?? [],
     };
     writeConfigFile(configPath, config);
   }
@@ -353,6 +440,63 @@ function createSandboxedBashOps(): BashOperations {
 
 // ── Extension ─────────────────────────────────────────────────────────────────
 
+// Re-execute a single bash command for auto-retry after grant.
+//
+// Used by the tool_result handler. Wraps the (already unwrapped) original
+// command with the CURRENT sandbox policy and runs it, accumulating stdout
+// and stderr into a single string. Returns the combined output and exit code.
+// Honours signal so the user can Esc the retry just like the original.
+async function retryBashCommand(
+  command: string,
+  cwd: string,
+  signal?: AbortSignal,
+): Promise<{ output: string; exitCode: number | null }> {
+  if (!existsSync(cwd)) {
+    throw new Error(`Working directory does not exist: ${cwd}`);
+  }
+
+  const wrappedCommand = await SandboxManager.wrapWithSandbox(command);
+
+  return new Promise((resolveExec, rejectExec) => {
+    const child = spawn("bash", ["-c", wrappedCommand], {
+      cwd,
+      env: process.env,
+      detached: true,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+
+    const chunks: Buffer[] = [];
+    child.stdout?.on("data", (d: Buffer) => chunks.push(d));
+    child.stderr?.on("data", (d: Buffer) => chunks.push(d));
+
+    const onAbort = () => {
+      if (child.pid) {
+        try {
+          process.kill(-child.pid, "SIGKILL");
+        } catch {
+          child.kill("SIGKILL");
+        }
+      }
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+
+    child.on("error", (err) => {
+      signal?.removeEventListener("abort", onAbort);
+      rejectExec(err);
+    });
+
+    child.on("close", (code) => {
+      signal?.removeEventListener("abort", onAbort);
+      const output = Buffer.concat(chunks).toString("utf8");
+      if (signal?.aborted) {
+        rejectExec(new Error("aborted"));
+      } else {
+        resolveExec({ output, exitCode: code });
+      }
+    });
+  });
+}
+
 export default function (pi: ExtensionAPI) {
   pi.registerFlag("no-sandbox", {
     description: "Disable OS-level sandboxing for bash commands",
@@ -366,19 +510,22 @@ export default function (pi: ExtensionAPI) {
   // Session-temporary allowances — held in JS memory, not accessible by the agent.
   // These are added on top of whatever is in the config files.
   const sessionAllowedDomains: string[] = [];
-  const sessionAllowedReadPaths: string[] = [];
   const sessionAllowedWritePaths: string[] = [];
+
+  // Original (unwrapped) bash commands keyed by toolCallId.
+  // Stashed in tool_call before we mutate event.input.command, so tool_result
+  // can re-execute the original command after the user grants access.
+  const originalCommandsByToolCallId = new Map<string, string>();
+
+  // Tool call IDs we've already auto-retried. Prevents infinite recursion if
+  // the retry hits another block (we fall through to the LLM-retry path then).
+  const autoRetriedToolCallIds = new Set<string>();
 
   // ── Effective config helpers ────────────────────────────────────────────────
 
   function getEffectiveAllowedDomains(cwd: string): string[] {
     const config = loadConfig(cwd);
     return [...(config.network?.allowedDomains ?? []), ...sessionAllowedDomains];
-  }
-
-  function getEffectiveAllowRead(cwd: string): string[] {
-    const config = loadConfig(cwd);
-    return [...(config.filesystem?.allowRead ?? []), ...sessionAllowedReadPaths];
   }
 
   function getEffectiveAllowWrite(cwd: string): string[] {
@@ -436,23 +583,6 @@ export default function (pi: ExtensionAPI) {
     return "global";
   }
 
-  async function promptReadBlock(
-    ctx: ExtensionContext,
-    filePath: string,
-  ): Promise<"abort" | "session" | "project" | "global"> {
-    if (!ctx.hasUI) return "abort";
-    const choice = await ctx.ui.select(`📖 Read blocked: "${filePath}" is not in allowRead`, [
-      "Abort (keep blocked)",
-      "Allow for this session only",
-      "Allow for this project  →  .pi/sandbox.json",
-      "Allow for all projects  →  ~/.pi/agent/sandbox.json",
-    ]);
-    if (!choice || choice.startsWith("Abort")) return "abort";
-    if (choice.startsWith("Allow for this session")) return "session";
-    if (choice.startsWith("Allow for this project")) return "project";
-    return "global";
-  }
-
   async function promptWriteBlock(
     ctx: ExtensionContext,
     filePath: string,
@@ -481,18 +611,6 @@ export default function (pi: ExtensionAPI) {
     if (!sessionAllowedDomains.includes(domain)) sessionAllowedDomains.push(domain);
     if (choice === "project") addDomainToConfig(projectPath, domain);
     if (choice === "global") addDomainToConfig(globalPath, domain);
-    await reinitializeSandbox(cwd);
-  }
-
-  async function applyReadChoice(
-    choice: "session" | "project" | "global",
-    filePath: string,
-    cwd: string,
-  ): Promise<void> {
-    const { globalPath, projectPath } = getConfigPaths(cwd);
-    if (!sessionAllowedReadPaths.includes(filePath)) sessionAllowedReadPaths.push(filePath);
-    if (choice === "project") addReadPathToConfig(projectPath, filePath);
-    if (choice === "global") addReadPathToConfig(globalPath, filePath);
     await reinitializeSandbox(cwd);
   }
 
@@ -536,13 +654,11 @@ export default function (pi: ExtensionAPI) {
     return { operations: createSandboxedBashOps() };
   });
 
-  // ── tool_call — network pre-check for bash, path policy for read/write/edit
+  // ── tool_call — network pre-check for bash + wrap with OS sandbox
 
   pi.on("tool_call", async (event, ctx) => {
     const config = loadConfig(ctx.cwd);
     if (!config.enabled) return;
-
-    const { projectPath, globalPath } = getConfigPaths(ctx.cwd);
 
     // Bash: network pre-check + wrap command with sandbox.
     // We don't own the bash tool (avoids conflict with pi-tool-display);
@@ -568,6 +684,8 @@ export default function (pi: ExtensionAPI) {
       // Wrap with OS sandbox (sandbox-exec / bwrap).
       try {
         event.input.command = await SandboxManager.wrapWithSandbox(originalCommand);
+        // Stash unwrapped command so tool_result can re-execute on grant.
+        originalCommandsByToolCallId.set(event.toolCallId, originalCommand);
       } catch (err) {
         ctx.ui.notify(
           `Sandbox wrap failed: ${err instanceof Error ? err.message : err}. Running unsandboxed.`,
@@ -576,81 +694,23 @@ export default function (pi: ExtensionAPI) {
       }
     }
 
-    // Path policy: read tool.
-    //   - If the path is already in effectiveAllowRead, allow silently.
-    //   - Otherwise always prompt, regardless of denyRead.
-    //   - Granting (session or permanent) adds to allowRead, which overrides denyRead.
-    //   - denyRead is never a hard-block on its own — it just sets the default
-    //     denied state that the prompt can override.
-    if (isToolCallEventType("read", event)) {
-      const filePath = event.input.path;
-      const effectiveAllowRead = getEffectiveAllowRead(ctx.cwd);
-
-      if (!matchesPattern(filePath, effectiveAllowRead)) {
-        const choice = await promptReadBlock(ctx, filePath);
-        if (choice === "abort") {
-          return {
-            block: true,
-            reason: `Sandbox: read access denied for "${filePath}"`,
-          };
-        }
-        await applyReadChoice(choice, filePath, ctx.cwd);
-        // Allowed — fall through, tool runs.
-        return;
-      }
-    }
-
-    // Path policy: write/edit — prompt for allowWrite, hard-block for denyWrite.
-    if (isToolCallEventType("write", event) || isToolCallEventType("edit", event)) {
-      const path = (event.input as { path: string }).path;
-      const allowWrite = getEffectiveAllowWrite(ctx.cwd);
-      const denyWrite = config.filesystem?.denyWrite ?? [];
-
-      if (allowWrite.length > 0 && !matchesPattern(path, allowWrite)) {
-        const choice = await promptWriteBlock(ctx, path);
-        if (choice === "abort") {
-          return {
-            block: true,
-            reason: `Sandbox: write access denied for "${path}" (not in allowWrite)`,
-          };
-        }
-        await applyWriteChoice(choice, path, ctx.cwd);
-
-        // denyWrite takes precedence — warn if it would still block.
-        if (matchesPattern(path, denyWrite)) {
-          ctx.ui.notify(
-            `⚠️ "${path}" was added to allowWrite, but it is also in denyWrite and will remain blocked.\n` +
-              `Check denyWrite in:\n  ${projectPath}\n  ${globalPath}`,
-            "warning",
-          );
-          return {
-            block: true,
-            reason: `Sandbox: write access denied for "${path}" (also in denyWrite)`,
-          };
-        }
-
-        // Allowed — fall through, tool runs.
-        return;
-      }
-
-      if (matchesPattern(path, denyWrite)) {
-        return {
-          block: true,
-          reason:
-            `Sandbox: write access denied for "${path}" (in denyWrite). ` +
-            `To change this, edit denyWrite in:\n  ${projectPath}\n  ${globalPath}`,
-        };
-      }
-    }
+    // Note: in-process read/write/edit tool gating is intentionally NOT
+    // handled here — use a permission rules extension (pi-claude-permissions)
+    // for that. The filesystem rules in config apply to bash subprocesses via
+    // the OS sandbox only.
   });
 
   // ── tool_result — detect OS-level write block in bash output ───────────────────
   //
-  // We don't own bash.execute (avoids conflict with pi-tool-display), so we
-  // can't re-run the command in-place. Instead, after the active bash tool
-  // runs the wrapped command, inspect output: if sandbox blocked a write,
-  // prompt user, update config, then inject a retry instruction into the
-  // result content for the LLM to retry on its next turn.
+  // We don't own bash.execute (avoids conflict with pi-tool-display). Instead,
+  // after the active bash tool runs the wrapped command, inspect output: if
+  // sandbox blocked a write, prompt user, update config, then re-execute the
+  // ORIGINAL command directly (with the new policy) and return the combined
+  // output. This keeps everything within a single LLM turn — the model never
+  // sees the failure, only the final retry result.
+  //
+  // Fallback: if the retry itself hits another block, we surface a
+  // "please retry" hint so the LLM can do another round next turn.
 
   pi.on("tool_result", async (event, ctx) => {
     if (!sandboxEnabled || !sandboxInitialized) return;
@@ -662,34 +722,101 @@ export default function (pi: ExtensionAPI) {
       .map((c) => c.text)
       .join("\n");
 
-    const blockedPath = extractBlockedWritePath(outputText);
-    if (!blockedPath) return;
+    const blockedPath = extractBlockedWritePath(outputText, ctx.cwd);
+    if (!blockedPath) {
+      // No block detected — release the stash so we don't leak memory.
+      originalCommandsByToolCallId.delete(event.toolCallId);
+      return;
+    }
+
+    // Pre-check denyWrite BEFORE prompting. denyWrite always wins over
+    // allowWrite, so granting allowWrite would be misleading: the OS sandbox
+    // would still block the write. Tell the user (and the LLM) up-front so
+    // they can either edit the sandbox.json by hand or skip the operation.
+    const initialConfig = loadConfig(ctx.cwd);
+    const { projectPath, globalPath } = getConfigPaths(ctx.cwd);
+    if (matchesPattern(blockedPath, initialConfig.filesystem?.denyWrite ?? [])) {
+      ctx.ui.notify(
+        `⚠️ "${blockedPath}" matches a denyWrite rule. denyWrite always wins over allowWrite — grant cannot help here. Edit denyWrite manually if needed.`,
+        "warning",
+      );
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text:
+              outputText +
+              `\n\n[Sandbox] Cannot grant write to "${blockedPath}": it matches a denyWrite rule (denyWrite always wins over allowWrite).\n` +
+              `To allow this path, manually remove the matching pattern from denyWrite in:\n  ${projectPath}\n  ${globalPath}\n` +
+              `Otherwise, choose a different path or skip this operation.`,
+          },
+        ],
+        isError: true,
+      };
+    }
 
     const choice = await promptWriteBlock(ctx, blockedPath);
     if (choice === "abort") return;
 
     await applyWriteChoice(choice, blockedPath, ctx.cwd);
 
-    const freshConfig = loadConfig(ctx.cwd);
-    const { projectPath, globalPath } = getConfigPaths(ctx.cwd);
-    if (matchesPattern(blockedPath, freshConfig.filesystem?.denyWrite ?? [])) {
-      ctx.ui.notify(
-        `⚠️ "${blockedPath}" was added to allowWrite, but it is also in denyWrite and will remain blocked.\n` +
-          `Check denyWrite in:\n  ${projectPath}\n  ${globalPath}`,
-        "warning",
-      );
-      return;
+    // Auto-retry: re-execute the original command with the new policy. We do
+    // this only once per tool call (autoRetriedToolCallIds) to avoid recursion
+    // if the retry triggers another block.
+    const originalCommand = originalCommandsByToolCallId.get(event.toolCallId);
+    const alreadyRetried = autoRetriedToolCallIds.has(event.toolCallId);
+    if (originalCommand && !alreadyRetried) {
+      autoRetriedToolCallIds.add(event.toolCallId);
+      try {
+        // ctx.signal is available in pi-coding-agent >= 0.62 but our peerDep
+        // pins ^0.61, so we can't depend on it. Pass undefined for now — the
+        // blocked-write retry is typically a single fast syscall.
+        const ctxSignal = (ctx as { signal?: AbortSignal }).signal;
+        const retry = await retryBashCommand(originalCommand, ctx.cwd, ctxSignal);
+        // If retry STILL produced a sandbox block, fall through to the
+        // LLM-retry hint path so the user can keep granting.
+        const retryStillBlocked = extractBlockedWritePath(retry.output, ctx.cwd) !== null;
+        if (!retryStillBlocked) {
+          ctx.ui.notify(
+            `✓ Auto-retried "${blockedPath}" after grant (exit ${retry.exitCode ?? "?"})`,
+            "info",
+          );
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: retry.output,
+              },
+            ],
+            isError: retry.exitCode !== 0,
+          };
+        }
+      } catch (err) {
+        ctx.ui.notify(
+          `Auto-retry failed: ${err instanceof Error ? err.message : err}. Falling back to LLM retry.`,
+          "warning",
+        );
+      } finally {
+        originalCommandsByToolCallId.delete(event.toolCallId);
+      }
     }
 
+    // Final fallback: we tried the auto-retry but it still hit a block we
+    // can't auto-handle (e.g. a different blocked path on the same command).
+    // Surface the granted path AND the latest output so the LLM can decide
+    // whether to retry, narrow the command, or ask the user.
     return {
       content: [
         {
           type: "text" as const,
           text:
             outputText +
-            `\n\n[Sandbox] Write access granted for "${blockedPath}". Please retry the command.`,
+            `\n\n[Sandbox] Granted write access for "${blockedPath}", but the auto-retry still hit a block. ` +
+            `If the same path is blocked, denyWrite is overriding allowWrite — inspect ${projectPath} or ${globalPath}. ` +
+            `Otherwise rerun the command and grant the next blocked path when prompted.`,
         },
       ],
+      isError: true,
     };
   });
 
@@ -847,6 +974,43 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+  pi.registerCommand("sandbox-init", {
+    description:
+      "Write the default sandbox config to disk so you can inspect or customize it. " +
+      "Usage: /sandbox-init [global|project] [force]",
+    handler: async (args, ctx) => {
+      const argList = (args ?? "").trim().split(/\s+/).filter(Boolean);
+      const scope = argList.includes("global") ? "global" : "project";
+      const force = argList.includes("force");
+
+      const { globalPath, projectPath } = getConfigPaths(ctx.cwd);
+      const targetPath = scope === "global" ? globalPath : projectPath;
+
+      if (existsSync(targetPath) && !force) {
+        ctx.ui.notify(
+          `Config already exists at ${targetPath}.\n` +
+            `Use \`/sandbox-init ${scope} force\` to overwrite.`,
+          "warning",
+        );
+        return;
+      }
+
+      try {
+        writeConfigFile(targetPath, DEFAULT_CONFIG);
+        ctx.ui.notify(
+          `Wrote default sandbox config to ${targetPath}.\n` +
+            `Edit it to customize, then run /sandbox-disable + /sandbox-enable to reload.`,
+          "info",
+        );
+      } catch (e) {
+        ctx.ui.notify(
+          `Failed to write ${targetPath}: ${e instanceof Error ? e.message : e}`,
+          "error",
+        );
+      }
+    },
+  });
+
   pi.registerCommand("sandbox", {
     description: "Show sandbox configuration",
     handler: async (_args, ctx) => {
@@ -870,21 +1034,18 @@ export default function (pi: ExtensionAPI) {
           ? [`  Session allowed: ${sessionAllowedDomains.join(", ")}`]
           : []),
         "",
-        "Filesystem (bash + read/write/edit tools):",
+        "Filesystem (bash subprocesses — OS-enforced):",
         `  Deny Read:   ${config.filesystem?.denyRead?.join(", ") || "(none)"}`,
         `  Allow Read:  ${config.filesystem?.allowRead?.join(", ") || "(none)"}`,
         `  Allow Write: ${config.filesystem?.allowWrite?.join(", ") || "(none)"}`,
         `  Deny Write:  ${config.filesystem?.denyWrite?.join(", ") || "(none)"}`,
-        ...(sessionAllowedReadPaths.length > 0
-          ? [`  Session read:  ${sessionAllowedReadPaths.join(", ")}`]
-          : []),
         ...(sessionAllowedWritePaths.length > 0
           ? [`  Session write: ${sessionAllowedWritePaths.join(", ")}`]
           : []),
         "",
-        "Note: ALL reads are prompted unless the path is already in allowRead.",
-        "Note: denyRead is not a hard-block — granting a prompt adds to allowRead, overriding denyRead.",
-        "Note: denyWrite takes PRECEDENCE over allowWrite and is never prompted.",
+        "Note: filesystem rules above apply to bash subprocesses only.",
+        "Note: allowRead OVERRIDES denyRead. denyWrite OVERRIDES allowWrite.",
+        "Note: read/write/edit tool gating is NOT handled here — use pi-claude-permissions.",
       ];
       ctx.ui.notify(lines.join("\n"), "info");
     },
