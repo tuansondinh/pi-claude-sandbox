@@ -16,7 +16,7 @@ spawns can touch.
 | **Owns the bash tool?** | Yes (`pi.registerTool({name: "bash"})`) | **No.** Mutates `event.input.command` at `tool_call`. Coexists with `pi-tool-display` and other bash-overriding extensions. |
 | **Read/Write/Edit tool gating** | In-process prompts on every tool call | **Removed.** Delegated to [`pi-claude-permissions`](https://www.npmjs.com/package/pi-claude-permissions) for proper allow/ask/deny rules. No double prompts. |
 | **Read prompts** | Yes — prompts on every miss | **None.** Reads are open by default; only your `denyRead` list is hard-blocked. |
-| **Write prompts** | Yes (in-process) | Yes — but via `tool_result` retry hint instead of in-place re-execute (since we don't own bash). |
+| **Write prompts** | Yes (in-process) | Yes — prompt at `tool_result`, then **auto-retry the original command in-place** with the new policy. The model only sees the final outcome (no "please retry" round-trip, no extra LLM turn). |
 | **Footer status** | Shows domain/path counts | Just `🔒 Sandbox` (clean). |
 | **Defaults** | Closed reads, broad home denies | **Open reads, closed writes, hard deny on secrets.** Pre-allowed tool caches (`~/.npm`, `~/.cargo`, etc.) so `npm install` etc. don't prompt-spam. |
 | **`/sandbox-init` command** | No | **Yes** — writes the current default config to disk for inspection/edit. |
@@ -167,7 +167,15 @@ The default is: bash cannot write anywhere. `allowWrite` is the whitelist.
 
 | If `allowWrite` = `["."]` and `denyWrite` = `[".env"]` | → write to `./src/foo.ts` ok, write to `./.env` blocked |
 
-Paths outside `allowWrite` fail and trigger the prompt-retry flow.
+Paths outside `allowWrite` fail and trigger the prompt-then-auto-retry flow:
+you get prompted (Abort / session / project / global), and on grant the
+original command is re-executed in place with the updated policy. The model
+only sees the final outcome — no extra LLM turn.
+
+If the blocked path matches a `denyWrite` rule, the prompt is skipped
+(grant would be a no-op since `denyWrite` always wins). The tool result
+explains this to the model and points at the relevant `sandbox.json` so the
+user can make a manual decision.
 
 ### Why this asymmetry?
 

@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.6.0] - 2026-04-25
+
+### Features
+- **Auto-retry on grant.** When the OS sandbox blocks a bash write, the user grants access, and the extension now re-executes the original command in-place and replaces the tool result content with the retry output. The model sees the final outcome only — no extra LLM turn, no "Please retry" round-trip.
+- Pre-check `denyWrite` before prompting. If the blocked path matches a `denyWrite` pattern, the user is no longer asked to grant access (it would be a no-op since `denyWrite` always wins). The tool result returns a clear explanation pointing at the relevant config file instead.
+- Toast distinguishes auto-retry success from "sandbox cleared but command still failed" (e.g. underlying Unix permission denial). Success uses `✓ info`, post-grant command failure uses `⚠ warning` with explicit reason.
+
+### Bug Fixes
+- `extractBlockedWritePath` now handles relative (`.env`), absolute (`/tmp/.env`), and `~`-prefixed paths from bash redirect errors. Previously the regex required a leading `/`, silently dropping relative paths and skipping the prompt entirely.
+- `matchesPattern` now uses a proper glob → regex converter that supports `**` (any depth), `*` (single segment), and `?`. The previous implementation called `resolve()` on every pattern, which mangled `**/.env` into `<cwd>/**/.env` and broke recursive matches — so the `denyWrite` pre-check could never fire on glob rules.
+- Final fallback message clarifies that the auto-retry was attempted and gives the user actionable next steps (manual `denyWrite` edit vs rerun).
+
 ## [0.5.3] - 2026-04-25
 
 ### Documentation
